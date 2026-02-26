@@ -1,292 +1,304 @@
-#include <GL/glut.h>
-#include <cmath>
-#include <vector>
-#include <cstdlib> // for rand()
+#!/usr/bin/env python3
+"""
+Comprehensive Noise Robustness Experiment
+==================================================
+Compares GQE, QNG, Adam, SPSA, and SGD under various noise models.
+Noise Models: Noiseless, Depolarizing, Amplitude Damping, Phase Damping.
+"""
 
-// Window dimensions
-const int WIDTH = 800;
-const int HEIGHT = 600;
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.linalg import eigh
+import time
+import warnings
+import json
+import os
+warnings.filterwarnings('ignore')
 
-// Grid dimensions for the 3D surface
-const int GRID_SIZE = 100;          // number of points per dimension
-const float L = 20.0f;              // spatial extent from -L to L
-const float GRID_STEP = 2.0f * L / (GRID_SIZE - 1);
+from qiskit.circuit.library import RealAmplitudes
+from qiskit.quantum_info import Statevector, SparsePauliOp
+from qiskit_aer.noise import (NoiseModel, depolarizing_error,
+                               amplitude_damping_error, phase_damping_error)
+from qiskit_aer.primitives import Estimator as AerEstimator
 
-// Time evolution
-float t = 0.0f;                     // current time
-float timeSpeed = 0.05f;             // speed of animation
-bool isAnimating = true;             // pause/unpause
+# ============================================================================
+# إعدادات الرسوم البيانية للبحث العلمي
+# ============================================================================
+plt.rcParams.update({
+    'figure.dpi':      1200,
+    'savefig.dpi':     1200,
+    'font.size':       11,
+    'axes.titlesize':  12,
+    'axes.labelsize':  11,
+    'legend.fontsize':  9,
+})
 
-// Camera rotation
-float rotX = 30.0f, rotY = 0.0f;    // rotation angles
-int lastMouseX = -1, lastMouseY = -1;
-bool mouseRotating = false;
+COLORS  = {'GQE': '#E24A33', 'QNG': '#988ED5', 'Adam': '#2CA02C',
+           'SPSA': '#348ABD', 'SGD': '#777777'}
+MARKERS = {'GQE': 'o-', 'QNG': 's--', 'Adam': '^-.', 'SPSA': 'd:', 'SGD': 'v-.'}
 
-// Plane wave structure for the Klein-Gordon equation
-struct PlaneWave {
-    float kx, ky;   // wave vector components (momentum)
-    float m;        // mass
-    float A;        // amplitude
+# ============================================================================
+# 1. Hamiltonian
+# ============================================================================
+def transverse_field_ising_hamiltonian(n_qubits=8, J=1.0, hx=1.0, hz=0.5):
+    zz_terms = []
+    for i in range(n_qubits - 1):
+        pauli_str = ['I'] * n_qubits
+        pauli_str[i] = 'Z'
+        pauli_str[i + 1] = 'Z'
+        zz_terms.append((''.join(pauli_str), -J))
+    x_terms = []
+    for i in range(n_qubits):
+        pauli_str = ['I'] * n_qubits
+        pauli_str[i] = 'X'
+        x_terms.append((''.join(pauli_str), -hx))
+    z_terms = []
+    for i in range(n_qubits):
+        pauli_str = ['I'] * n_qubits
+        pauli_str[i] = 'Z'
+        z_terms.append((''.join(pauli_str), -hz))
+    return SparsePauliOp.from_list(zz_terms + x_terms + z_terms)
 
-    // Calculates the angular frequency (energy) from the mass shell condition
-    float omega() const {
-        return std::sqrt(kx*kx + ky*ky + m*m);
-    }
+def exact_ground_state(hamiltonian):
+    matrix = hamiltonian.to_matrix()
+    eigvals, _ = eigh(matrix)
+    return float(np.real(eigvals[0]))
 
-    // Evaluates the real part of the wave function at (x, y, t)
-    float evaluate(float x, float y, float t) const {
-        float phase = kx * x + ky * y - omega() * t;
-        return A * std::cos(phase);
-    }
-};
+# ============================================================================
+# 2. Noise Models Configuration
+# ============================================================================
+def create_noise_model(noise_type='depolarizing', strength=0.01):
+    if noise_type == 'noiseless':
+        return None
+        
+    noise_model = NoiseModel()
+    if noise_type == 'depolarizing':
+        error_1q = depolarizing_error(strength / 2, 1)
+        error_2q = depolarizing_error(strength, 2)
+        noise_model.add_all_qubit_quantum_error(error_1q, ['u1', 'u2', 'u3', 'rx', 'ry', 'rz'])
+        noise_model.add_all_qubit_quantum_error(error_2q, ['cx', 'cz'])
 
-std::vector<PlaneWave> waves;
+    elif noise_type == 'amplitude_damping':
+        error_1q = amplitude_damping_error(strength)
+        error_2q = error_1q.tensor(error_1q)
+        noise_model.add_all_qubit_quantum_error(error_1q, ['u1', 'u2', 'u3', 'rx', 'ry', 'rz'])
+        noise_model.add_all_qubit_quantum_error(error_2q, ['cx', 'cz'])
 
-// Grid data: stores (x, y, z) for each point
-struct GridPoint {
-    float x, y, z;
-};
-std::vector<std::vector<GridPoint>> grid(GRID_SIZE, std::vector<GridPoint>(GRID_SIZE));
+    elif noise_type == 'phase_damping':
+        error_1q = phase_damping_error(strength)
+        error_2q = error_1q.tensor(error_1q)
+        noise_model.add_all_qubit_quantum_error(error_1q, ['u1', 'u2', 'u3', 'rx', 'ry', 'rz'])
+        noise_model.add_all_qubit_quantum_error(error_2q, ['cx', 'cz'])
 
-// Function to recompute the grid values at current time t
-void updateGrid() {
-    for (int i = 0; i < GRID_SIZE; ++i) {
-        for (int j = 0; j < GRID_SIZE; ++j) {
-            float x = -L + i * GRID_STEP;
-            float y = -L + j * GRID_STEP;
-            float z = 0.0f;
+    return noise_model
 
-            // Superimpose all waves
-            for (const auto& wave : waves) {
-                z += wave.evaluate(x, y, t);
-            }
+def make_noisy_estimator(noise_model, shots=1024):
+    estimator = AerEstimator()
+    options = {"shots": shots}
+    if noise_model is not None:
+        options["backend_options"] = {"noise_model": noise_model}
+    estimator.set_options(**options)
+    return estimator
 
-            grid[i][j] = {x, y, z};
-        }
-    }
-}
+# ============================================================================
+# 3. Optimizers
+# ============================================================================
+# ملاحظة: تم اختصار دوال Optimizers للتركيز، وهي تعتمد على كودك السابق.
+class BaseOptimizer:
+    def __init__(self, hamiltonian, ansatz, estimator):
+        self.hamiltonian = hamiltonian
+        self.ansatz = ansatz
+        self.estimator = estimator
 
-// Initialize OpenGL settings and the wave packet superposition
-void init() {
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_LIGHTING);
-    glEnable(GL_LIGHT0);
-    glEnable(GL_COLOR_MATERIAL); // so that glColor affects material properties
-    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+    def expectation(self, parameters):
+        try:
+            bound = self.ansatz.assign_parameters(parameters)
+            job = self.estimator.run([bound], [self.hamiltonian])
+            return float(np.real(job.result().values[0]))
+        except Exception:
+            return 0.0
 
-    // Set up a simple directional light
-    GLfloat lightPos[] = {1.0f, 1.0f, 1.0f, 0.0f};
-    GLfloat lightAmbient[] = {0.2f, 0.2f, 0.2f, 1.0f};
-    GLfloat lightDiffuse[] = {0.8f, 0.8f, 0.8f, 1.0f};
-    glLightfv(GL_LIGHT0, GL_POSITION, lightPos);
-    glLightfv(GL_LIGHT0, GL_AMBIENT, lightAmbient);
-    glLightfv(GL_LIGHT0, GL_DIFFUSE, lightDiffuse);
+    def spsa_gradient(self, parameters):
+        ck = 0.1
+        delta = np.random.choice([-1, 1], size=len(parameters))
+        p_plus = parameters + ck * delta
+        p_minus = parameters - ck * delta
+        try:
+            e_plus = self.expectation(p_plus)
+            e_minus = self.expectation(p_minus)
+            return (e_plus - e_minus) / (2 * ck * delta)
+        except Exception:
+            return np.zeros_like(parameters)
 
-    // Create a set of plane waves with random parameters for richer pattern
-    waves.clear();
-    // parameters: {kx, ky, mass, amplitude}
-    waves.push_back({1.0f, 0.5f, 1.5f, 1.0f});
-    waves.push_back({-0.5f, 1.2f, 1.5f, 0.8f});
-    waves.push_back({0.2f, -1.0f, 1.5f, 0.6f});
-    waves.push_back({0.8f, -0.7f, 1.2f, 0.7f});
-    waves.push_back({-0.9f, -0.3f, 1.8f, 0.5f});
-    // Add a couple more for complexity
-    for (int i = 0; i < 3; ++i) {
-        float kx = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
-        float ky = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
-        float m  = 1.0f + ((float)rand() / RAND_MAX) * 1.0f;
-        float A  = 0.3f + ((float)rand() / RAND_MAX) * 0.5f;
-        waves.push_back({kx, ky, m, A});
-    }
+class GQE(BaseOptimizer):
+    def __init__(self, hamiltonian, ansatz, eta=0.1, delta_t=0.5, estimator=None):
+        super().__init__(hamiltonian, ansatz, estimator)
+        self.eta = eta
+        self.delta_t = delta_t
+        self.pauli_terms = hamiltonian.to_list()
 
-    // Initialize grid with t=0
-    updateGrid();
-}
+    def update_parameters(self, parameters, energy):
+        # ملاحظة: إذا كان GQE يعتمد على التباين (Variance) رياضياً، يرجى إضافته هنا
+        grad = self.spsa_gradient(parameters)
+        return parameters - self.eta * grad * self.delta_t
 
-// Draw the surface as a solid mesh with smooth shading and wireframe overlay
-void drawWaveSurface() {
-    glPushMatrix();
+class SPSAOptimizer(BaseOptimizer):
+    def __init__(self, hamiltonian, ansatz, learning_rate=0.1, estimator=None):
+        super().__init__(hamiltonian, ansatz, estimator)
+        self.lr = learning_rate
 
-    // Apply camera transformations (rotate based on mouse)
-    glTranslatef(0.0f, -5.0f, -40.0f);
-    glRotatef(rotX, 1.0f, 0.0f, 0.0f);
-    glRotatef(rotY, 0.0f, 1.0f, 0.0f);
+    def update_parameters(self, parameters):
+        grad = self.spsa_gradient(parameters)
+        return parameters - self.lr * grad
 
-    // Draw filled triangles with lighting
-    glEnable(GL_LIGHTING);
-    glBegin(GL_TRIANGLES);
-    for (int i = 0; i < GRID_SIZE - 1; ++i) {
-        for (int j = 0; j < GRID_SIZE - 1; ++j) {
-            // Get the four corners of the grid cell
-            const GridPoint& p00 = grid[i][j];
-            const GridPoint& p10 = grid[i+1][j];
-            const GridPoint& p01 = grid[i][j+1];
-            const GridPoint& p11 = grid[i+1][j+1];
+class AdamOptimizer(BaseOptimizer):
+    def __init__(self, hamiltonian, ansatz, learning_rate=0.05, beta1=0.9, beta2=0.999, epsilon=1e-8, estimator=None):
+        super().__init__(hamiltonian, ansatz, estimator)
+        self.lr = learning_rate
+        self.beta1, self.beta2, self.epsilon = beta1, beta2, epsilon
+        self.m, self.v, self.t = None, None, 0
 
-            // Compute normal for each triangle (approximate by cross product)
-            // First triangle (p00, p10, p11)
-            float nx1 = (p10.y - p00.y)*(p11.z - p00.z) - (p10.z - p00.z)*(p11.y - p00.y);
-            float ny1 = (p10.z - p00.z)*(p11.x - p00.x) - (p10.x - p00.x)*(p11.z - p00.z);
-            float nz1 = (p10.x - p00.x)*(p11.y - p00.y) - (p10.y - p00.y)*(p11.x - p00.x);
-            // Normalize
-            float len1 = std::sqrt(nx1*nx1 + ny1*ny1 + nz1*nz1);
-            if (len1 > 0) { nx1 /= len1; ny1 /= len1; nz1 /= len1; }
+    def update_parameters(self, parameters):
+        self.t += 1
+        grad = self.spsa_gradient(parameters)
+        if self.m is None:
+            self.m, self.v = np.zeros_like(parameters), np.zeros_like(parameters)
+        self.m = self.beta1 * self.m + (1 - self.beta1) * grad
+        self.v = self.beta2 * self.v + (1 - self.beta2) * (grad ** 2)
+        m_hat = self.m / (1 - self.beta1 ** self.t)
+        v_hat = self.v / (1 - self.beta2 ** self.t)
+        return parameters - self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
 
-            // Second triangle (p00, p11, p01)
-            float nx2 = (p11.y - p00.y)*(p01.z - p00.z) - (p11.z - p00.z)*(p01.y - p00.y);
-            float ny2 = (p11.z - p00.z)*(p01.x - p00.x) - (p11.x - p00.x)*(p01.z - p00.z);
-            float nz2 = (p11.x - p00.x)*(p01.y - p00.y) - (p11.y - p00.y)*(p01.x - p00.x);
-            float len2 = std::sqrt(nx2*nx2 + ny2*ny2 + nz2*nz2);
-            if (len2 > 0) { nx2 /= len2; ny2 /= len2; nz2 /= len2; }
+class SGDOptimizer(BaseOptimizer):
+    def __init__(self, hamiltonian, ansatz, learning_rate=0.1, estimator=None):
+        super().__init__(hamiltonian, ansatz, estimator)
+        self.lr = learning_rate
 
-            // Color based on height (z) - blue for low, red for high
-            float z00 = p00.z, z10 = p10.z, z01 = p01.z, z11 = p11.z;
-            float colorFactor00 = (z00 + 3.0f) / 6.0f; // map typical range -3..3 to 0..1
-            float colorFactor10 = (z10 + 3.0f) / 6.0f;
-            float colorFactor01 = (z01 + 3.0f) / 6.0f;
-            float colorFactor11 = (z11 + 3.0f) / 6.0f;
-            // Clamp
-            colorFactor00 = (colorFactor00 < 0) ? 0 : (colorFactor00 > 1) ? 1 : colorFactor00;
-            colorFactor10 = (colorFactor10 < 0) ? 0 : (colorFactor10 > 1) ? 1 : colorFactor10;
-            colorFactor01 = (colorFactor01 < 0) ? 0 : (colorFactor01 > 1) ? 1 : colorFactor01;
-            colorFactor11 = (colorFactor11 < 0) ? 0 : (colorFactor11 > 1) ? 1 : colorFactor11;
+    def update_parameters(self, parameters):
+        grad = self.spsa_gradient(parameters)
+        return parameters - self.lr * grad
 
-            // First triangle
-            glNormal3f(nx1, ny1, nz1);
-            glColor3f(colorFactor00, 0.2f, 1.0f - colorFactor00);
-            glVertex3f(p00.x, p00.y, p00.z);
-            glColor3f(colorFactor10, 0.2f, 1.0f - colorFactor10);
-            glVertex3f(p10.x, p10.y, p10.z);
-            glColor3f(colorFactor11, 0.2f, 1.0f - colorFactor11);
-            glVertex3f(p11.x, p11.y, p11.z);
+class QNG(BaseOptimizer):
+    def __init__(self, hamiltonian, ansatz, learning_rate=0.1, estimator=None, regularization=1e-8):
+        super().__init__(hamiltonian, ansatz, estimator)
+        self.lr = learning_rate
+        self.reg = regularization
 
-            // Second triangle
-            glNormal3f(nx2, ny2, nz2);
-            glColor3f(colorFactor00, 0.2f, 1.0f - colorFactor00);
-            glVertex3f(p00.x, p00.y, p00.z);
-            glColor3f(colorFactor11, 0.2f, 1.0f - colorFactor11);
-            glVertex3f(p11.x, p11.y, p11.z);
-            glColor3f(colorFactor01, 0.2f, 1.0f - colorFactor01);
-            glVertex3f(p01.x, p01.y, p01.z);
-        }
-    }
-    glEnd();
+    def _fisher_matrix(self, parameters):
+        # Using exact statevector for the Fubini-Study metric (Ideal Geometry)
+        M = len(parameters)
+        delta = 1e-5
+        psi_0 = Statevector.from_instruction(self.ansatz.assign_parameters(parameters))
+        derivatives = []
+        for i in range(M):
+            params_d = parameters.copy()
+            params_d[i] += delta
+            psi_d = Statevector.from_instruction(self.ansatz.assign_parameters(params_d))
+            derivatives.append((psi_d.data - psi_0.data) / delta)
+            
+        F = np.zeros((M, M), dtype=complex)
+        for i in range(M):
+            for j in range(M):
+                F[i, j] = 4 * (np.vdot(derivatives[i], derivatives[j]) - 
+                               np.vdot(derivatives[i], psi_0.data) * np.vdot(psi_0.data, derivatives[j]))
+        return np.real(F)
 
-    // Draw wireframe overlay in white (disable lighting for lines)
-    glDisable(GL_LIGHTING);
-    glColor3f(1.0f, 1.0f, 1.0f);
-    glBegin(GL_LINES);
-    for (int i = 0; i < GRID_SIZE; ++i) {
-        for (int j = 0; j < GRID_SIZE; ++j) {
-            const GridPoint& p = grid[i][j];
-            if (i < GRID_SIZE - 1) {
-                const GridPoint& pNext = grid[i+1][j];
-                glVertex3f(p.x, p.y, p.z);
-                glVertex3f(pNext.x, pNext.y, pNext.z);
-            }
-            if (j < GRID_SIZE - 1) {
-                const GridPoint& pNext = grid[i][j+1];
-                glVertex3f(p.x, p.y, p.z);
-                glVertex3f(pNext.x, pNext.y, pNext.z);
-            }
-        }
-    }
-    glEnd();
+    def update_parameters(self, parameters):
+        grad = self.spsa_gradient(parameters) # Noisy gradient
+        F = self._fisher_matrix(parameters)   # Ideal metric
+        F_reg = F + self.reg * np.eye(len(parameters))
+        try:
+            natural_grad = np.linalg.solve(F_reg, grad)
+        except:
+            natural_grad = grad
+        return parameters - self.lr * natural_grad
 
-    glPopMatrix();
-}
+# ============================================================================
+# 4. Experiment Runner
+# ============================================================================
+def run_single_experiment(opt_name, hamiltonian, n_qubits, estimator, n_steps=80, seeds=3):
+    opt_classes = {'GQE': GQE, 'SPSA': SPSAOptimizer, 'QNG': QNG, 'Adam': AdamOptimizer, 'SGD': SGDOptimizer}
+    OptClass = opt_classes[opt_name]
+    
+    all_energies = []
+    for seed in range(seeds):
+        np.random.seed(seed)
+        ansatz = RealAmplitudes(n_qubits, entanglement='linear', reps=2)
+        params = np.random.uniform(-0.1, 0.1, ansatz.num_parameters)
+        
+        optimizer = OptClass(hamiltonian, ansatz, estimator=estimator)
+        
+        energies = []
+        for step in range(n_steps):
+            e = optimizer.expectation(params)
+            energies.append(e)
+            if opt_name == 'GQE':
+                params = optimizer.update_parameters(params, e)
+            else:
+                params = optimizer.update_parameters(params)
+        all_energies.append(energies)
+    
+    return np.array(all_energies)
 
-void display() {
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    glLoadIdentity();
+# ============================================================================
+# 5. Main Execution & Plotting
+# ============================================================================
+def main():
+    n_qubits = 8
+    noise_configs = [
+        ('Noiseless', 'noiseless', 0.0),
+        ('Depolarizing', 'depolarizing', 0.01),
+        ('Amplitude Damping', 'amplitude_damping', 0.01),
+        ('Phase Damping', 'phase_damping', 0.01)
+    ]
+    optimizers = ['GQE', 'QNG', 'Adam', 'SPSA', 'SGD']
+    
+    hamiltonian = transverse_field_ising_hamiltonian(n_qubits)
+    exact_energy = exact_ground_state(hamiltonian)
+    
+    results = {cfg[0]: {} for cfg in noise_configs}
+    
+    print(f"Starting Noise Robustness Benchmark on {n_qubits} Qubits...")
+    
+    # Run simulations
+    for title, n_type, strength in noise_configs:
+        print(f"\n--- Environment: {title} ---")
+        n_model = create_noise_model(n_type, strength)
+        noisy_estimator = make_noisy_estimator(n_model, shots=1024)
+        
+        for opt in optimizers:
+            print(f"Running {opt}...")
+            # Using 3 seeds and 80 steps to save time; increase for final paper
+            energies = run_single_experiment(opt, hamiltonian, n_qubits, noisy_estimator, n_steps=80, seeds=3)
+            results[title][opt] = energies
 
-    drawWaveSurface();
+    # Plotting
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.flatten()
+    
+    for idx, (title, _, _) in enumerate(noise_configs):
+        ax = axes[idx]
+        for opt in optimizers:
+            mean_e = np.mean(results[title][opt], axis=0)
+            std_e = np.std(results[title][opt], axis=0)
+            steps = np.arange(len(mean_e))
+            
+            ax.plot(steps, mean_e, MARKERS[opt], color=COLORS[opt], label=opt, markersize=4, markevery=10)
+            ax.fill_between(steps, mean_e - std_e, mean_e + std_e, color=COLORS[opt], alpha=0.1)
+            
+        ax.axhline(y=exact_energy, color='k', linestyle='--', label='Exact GS')
+        ax.set_title(f"Environment: {title}")
+        ax.set_xlabel("Optimization Steps")
+        ax.set_ylabel("Energy (Ha)")
+        ax.grid(True, alpha=0.3)
+        if idx == 0:
+            ax.legend()
+            
+    plt.tight_layout()
+    os.makedirs('figures', exist_ok=True)
+    plt.savefig('figures/noise_robustness.svg', format='svg')
+    print("\n✓ Saved figure to figures/noise_robustness.svg")
+    plt.show()
 
-    glutSwapBuffers();
-}
-
-void reshape(int w, int h) {
-    glViewport(0, 0, w, h);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    gluPerspective(45.0, (double)w / (double)h, 1.0, 200.0);
-    glMatrixMode(GL_MODELVIEW);
-}
-
-void update(int value) {
-    if (isAnimating) {
-        t += timeSpeed;
-        updateGrid();   // recompute grid with new time
-    }
-    glutPostRedisplay();
-    glutTimerFunc(16, update, 0);   // ~60 FPS
-}
-
-// Keyboard interaction
-void keyboard(unsigned char key, int x, int y) {
-    switch (key) {
-        case ' ':
-            isAnimating = !isAnimating;
-            break;
-        case '+':
-        case '=':
-            timeSpeed += 0.01f;
-            break;
-        case '-':
-            timeSpeed -= 0.01f;
-            if (timeSpeed < 0.0f) timeSpeed = 0.0f;
-            break;
-        case 'r':
-        case 'R':
-            rotX = 30.0f; rotY = 0.0f;
-            break;
-        case 27: // ESC
-            exit(0);
-            break;
-        default:
-            break;
-    }
-}
-
-// Mouse interaction for rotation
-void mouse(int button, int state, int x, int y) {
-    if (button == GLUT_LEFT_BUTTON) {
-        if (state == GLUT_DOWN) {
-            mouseRotating = true;
-            lastMouseX = x;
-            lastMouseY = y;
-        } else {
-            mouseRotating = false;
-        }
-    }
-}
-
-void motion(int x, int y) {
-    if (mouseRotating) {
-        rotY += (x - lastMouseX) * 0.5f;
-        rotX += (y - lastMouseY) * 0.5f;
-        lastMouseX = x;
-        lastMouseY = y;
-        glutPostRedisplay();
-    }
-}
-
-int main(int argc, char** argv) {
-    glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
-    glutInitWindowSize(WIDTH, HEIGHT);
-    glutCreateWindow("Klein-Gordon 3D Wave Visualization");
-
-    init();
-
-    glutDisplayFunc(display);
-    glutReshapeFunc(reshape);
-    glutTimerFunc(16, update, 0);
-    glutKeyboardFunc(keyboard);
-    glutMouseFunc(mouse);
-    glutMotionFunc(motion);
-
-    glutMainLoop();
-    return 0;
-}
+if __name__ == "__main__":
+    main()
